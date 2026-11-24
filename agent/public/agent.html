@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>LinkDesk Agent</title>
+<style>
+  html,body{margin:0;background:#000;overflow:hidden;width:100%;height:100%}
+  canvas{width:100vw;height:100vh;object-fit:contain;display:block}
+</style>
+</head>
+<body>
+<canvas id="screen" width="1280" height="800"></canvas>
+<script>
+(function () {
+  'use strict';
+  const canvas = document.getElementById('screen');
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#0b0f1a';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // 用 canvas 生成视频轨（浏览器原生编码 VP8/VP9，与桌面端一致）
+  const stream = canvas.captureStream(15);
+
+  let code = '';
+  let signalUrl = '';
+  let signalSocket = null;
+  let pc = null;
+  let dc = null;
+  let iceBuffer = [];
+  let makingOffer = false;
+  let ignoreOffer = false;
+  const polite = false; // 被控端为 impolite peer
+  const iceServers = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+  ];
+
+  function log() { console.log('[agent-page]', ...arguments); }
+
+  function sendSignal(data) {
+    if (signalSocket && signalSocket.readyState === WebSocket.OPEN) {
+      signalSocket.send(JSON.stringify({ type: 'signal', data }));
+    }
+  }
+
+  // ---- 画帧 ----
+  const img = new Image();
+  let lastFrameUrl = '';
+  function drawFrame(dataUrl) {
+    lastFrameUrl = dataUrl;
+    img.onload = () => {
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    };
+    img.src = dataUrl;
+  }
+  // 页面静止时 screencast 不产帧，但 captureStream 需要持续帧维持 WebRTC 流。
+  // 每 200ms 重绘缓存帧（drawImage 触发 captureStream 出新帧），保证流不断。
+  const keepAliveImg = new Image();
+  setInterval(() => {
+    if (!lastFrameUrl) return;
+    if (keepAliveImg.src !== lastFrameUrl) keepAliveImg.src = lastFrameUrl;
+    if (keepAliveImg.complete && keepAliveImg.naturalWidth) {
+      ctx.drawImage(keepAliveImg, 0, 0, canvas.width, canvas.height);
+    }
+  }, 200);
+
+  // ---- 连接本地帧服务 ----
+  function connectLocal() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(proto + '://' + location.host);
+    ws.onmessage = (e) => {
+      let msg;
+      try { msg = JSON.parse(e.data); } catch { return; }
+      if (msg.type === 'config') {
+        code = msg.code;
+        signalUrl = msg.signal.replace(/^http/, 'ws') + '/ws?code=' + encodeURIComponent(code) + '&role=agent';
+        connectSignal();
+      } else if (msg.type === 'frame' && msg.data) {
+        drawFrame(msg.data);
+      }
+    };
+    ws.onclose = () => setTimeout(connectLocal, 1000);
+    ws.onerror = () => ws.close();
+  }
+
+  // ---- 连接信令（被控端角色） ----
+  function connectSignal() {
+    if (!signalUrl) return;
+    log('连接信令', signalUrl);
+    signalSocket = new WebSocket(signalUrl);
+    signalSocket.onopen = () => log('信令已连接 · 口令', code);
+    signalSocket.onmessage = async (e) => {
+      let msg;
+      try { msg = JSON.parse(e.data); } catch { return; }
+      if (msg.type === 'ping') {
+        signalSocket.send(JSON.stringify({ type: 'pong', t: msg.t }));
+      } else if (msg.type === 'peer-update') {
+        if (msg.controller && !pc) createPeerConnection();
+      } else if (msg.type === 'signal') {
+        await onSignalData(msg.data);
+      } else if (msg.type === 'peer-left') {
+        // 控制端离开，保留 PC 以便重连（DataChannel 会关闭）
+      }
+    };
+    signalSocket.onclose = () => setTimeout(connectSignal, 2000);
+    signalSocket.onerror = () => signalSocket.close();
+    // 心跳
+    setInterval(() => {
+      if (signalSocket && signalSocket.readyState === WebSocket.OPEN) {
+        signalSocket.send(JSON.stringify({ type: 'ping', t: Date.now() }));
+      }
+    }, 20000);
+  }
+
+  function createPeerConnection() {
+    pc = new RTCPeerConnection({ iceServers });
+    // 推流：canvas 视频轨
+    stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+    // 被控端创建 DataChannel 接收输入
+    dc = pc.createDataChannel('input', { ordered: true });
+    dc.onopen = () => log('DataChannel 已打开');
+    dc.onmessage = (e) => {
+      let ev;
+      try { ev = JSON.parse(e.data); } catch { return; }
+      // 通过本地 HTTP 回传给 Node → CDP 注入
+      fetch('/input', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(ev) }).catch(() => {});
+    };
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) sendSignal({ kind: 'ice', candidate: e.candidate.toJSON() });
+    };
+    pc.onconnectionstatechange = () => log('PC 状态', pc.connectionState);
+  }
+
+  async function onSignalData(data) {
+    if (!pc) createPeerConnection();
+    const d = data || {};
+    try {
+      if (d.kind === 'description' && d.description) {
+        const offerCollision = d.description.type === 'offer' && (makingOffer || pc.signalingState !== 'stable');
+        ignoreOffer = !polite && offerCollision;
+        if (ignoreOffer) return;
+        await pc.setRemoteDescription(d.description);
+        if (d.description.type === 'offer') {
+          await pc.setLocalDescription();
+          sendSignal({ kind: 'description', description: pc.localDescription });
+        }
+        for (const c of iceBuffer) { try { await pc.addIceCandidate(c); } catch {} }
+        iceBuffer = [];
+      } else if (d.kind === 'ice' && d.candidate) {
+        if (!ignoreOffer) {
+          try { await pc.addIceCandidate(d.candidate); } catch (err) { if (!ignoreOffer) log('ICE 错误', String(err)); }
+        }
+      }
+    } catch (err) {
+      log('信令处理失败', String(err));
+    }
+  }
+
+  connectLocal();
+})();
+</script>
+</body>
+</html>
