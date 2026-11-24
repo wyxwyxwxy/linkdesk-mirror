@@ -1,0 +1,10 @@
+{
+  "name": "linkdesk-container-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "LinkDesk 容器被控端：自动绑定、WebRTC 推流、CDP 输入注入",
+  "dependencies": {
+    "puppeteer-core": "^23.11.1",
+    "ws": "^8.18.0"
+  }
+}
